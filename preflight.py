@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 
@@ -82,9 +83,15 @@ def scan_bytes(path: str, data: bytes, revision: str = "", terms: tuple[str, ...
 
 
 def git(root: Path, *args: str) -> bytes:
+    location = shutil.which("git")
+    if not location:
+        raise ValueError("Git is not installed")
+    executable = Path(location).resolve()
+    if executable.is_relative_to(root) or executable.parent == Path.cwd().resolve():
+        raise ValueError("Refusing a Git executable from the scanned repository or current directory")
     environment = {key: value for key, value in os.environ.items() if not key.upper().startswith("GIT_")}
     environment.update({"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0"})
-    command = ["git", "--no-pager", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=" + os.devnull,
+    command = [str(executable), "--no-pager", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=" + os.devnull,
                "-c", "log.showSignature=false", "-c", "maintenance.auto=false", "-c", "gc.auto=0", "-C", str(root), *args]
     result = subprocess.run(command, capture_output=True, check=False, env=environment, timeout=60)
     if result.returncode:

@@ -6,11 +6,20 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 import preflight
 
 
 class PreflightTests(unittest.TestCase):
+    def test_repository_git_executable_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            with mock.patch.object(preflight.shutil, "which", return_value=str(root / "git.exe")), mock.patch.object(preflight.subprocess, "run") as child:
+                with self.assertRaises(ValueError):
+                    preflight.git(root, "ls-files")
+                child.assert_not_called()
+
     def test_sensitive_values_never_enter_report(self):
         token = "gh" + "p_" + "aB1cD2eF3gH4iJ5kL6mN7oP8qR9sT0"
         email = "private" + "@" + "example.org"
