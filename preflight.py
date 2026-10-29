@@ -166,6 +166,7 @@ def git(root: Path, *args: str, deadline: float | None = None, input: bytes | No
 
 
 def current_files(root: Path, tracked: bool):
+    root = root.resolve(strict=True)
     if tracked:
         names = git(root, "ls-files", "-z").decode("utf-8").split("\0")
         paths = [root / name for name in names if name]

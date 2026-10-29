@@ -471,6 +471,14 @@ class PreflightTests(unittest.TestCase):
                 self.skipTest("Creating symlinks requires OS permission")
             self.assertEqual([item[0] for item in preflight.current_files(root, False)], ["real.txt"])
 
+    def test_noncanonical_root_does_not_drop_regular_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "nested").mkdir()
+            (root / "real.txt").write_text("hello")
+            self.assertEqual(list(preflight.current_files(root / "nested" / "..", False)),
+                             [("real.txt", b"hello")])
+
     def test_skipped_directories_are_not_traversed(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
