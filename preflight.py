@@ -29,13 +29,13 @@ OBJECT_ID = re.compile(rb"[0-9a-f]{40}|[0-9a-f]{64}")
 SKIP_DIRS = {".git", ".venv", "venv", "node_modules", "__pycache__", ".pytest_cache"}
 EMAIL = re.compile(r"\b[A-Z0-9._%+-]{1,64}@[A-Z0-9.-]{1,253}\.[A-Z]{2,63}(?![A-Z0-9-])", re.I)
 PERSONAL_PATH = re.compile(r"(?:[A-Z]:[\\/]Users[\\/][^\\/\s]+|/(?:Users|home)/[^/\s]+)", re.I)
-TOKEN = re.compile(r"(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{30,}|sk-(?:proj-)?[A-Za-z0-9_-]{20,}|AKIA[A-Z0-9]{16}|sk_live_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{20,}|AIza[A-Za-z0-9_-]{35})")
+TOKEN = re.compile(r"(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{30,}|sk-(?:proj-)?[A-Za-z0-9_-]{20,}|AKIA[A-Z0-9]{16}|(?<!\w)ASIA[A-Z0-9]{16}(?!\w)|sk_live_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{20,}|AIza[A-Za-z0-9_-]{35})")
 FIELD_PATTERN = (r"(?<![\w-])(?=[a-z0-9_-]{0," + str(MAX_FIELD_NAME - 1)
                  + r"}(?:api[_-]?key|token|password|secret|credential))"
                  + r"[a-z0-9_-]{1," + str(MAX_FIELD_NAME) + r"}(?![\w-])")
 QUOTED_VALUE = r'''(?:"([^"\\\r\n]*+(?:\\[^\r\n][^"\\\r\n]*+)*+)"|'([^'\\\r\n]*+(?:\\[^\r\n][^'\\\r\n]*+)*+)')'''
 ASSIGNMENT = re.compile(r"[\"']?" + FIELD_PATTERN + r"[\"']?\]?\s*(?::[ \t]*[A-Za-z_][\w.\[\]| \t]{0,64}?=|:=|=>|[:=])\s*(?:\(\s*)?" + QUOTED_VALUE, re.I)
-ENV_ASSIGNMENT = re.compile(r"^[ \t]*(?:export[ \t]+)?" + FIELD_PATTERN + r"[ \t]*[:=][ \t]*([^\s\"'#$({][^\s#;]{7,})[ \t\r]*$", re.I | re.M)
+ENV_ASSIGNMENT = re.compile(r"^[ \t]*(?:export[ \t]+)?" + FIELD_PATTERN + r"[ \t]*[:=][ \t]*([^\s\"'#$({][^\s;]{7,}+)(?:[ \t]+#[^\r\n]*)?[ \t\r]*$", re.I | re.M)
 FALLBACK = re.compile(FIELD_PATTERN + r"\s*=\s*(?:process\.env\.[A-Z0-9_]+|os\.environ\.get\([^()\r\n]{0,1024}\)|os\.getenv\([^()\r\n]{0,1024}\))\s*(?:\|\||or)\s*" + QUOTED_VALUE, re.I)
 PLACEHOLDER = re.compile(r"^(?:your[-_ ].*|replace[-_ ].*|example|example[-_ ].*|placeholder|placeholder[-_ ].*|changeme|<.*>|\$\{.*\}|test[-_ ].*)$", re.I)
 PRIVATE_KEY = re.compile(r"-----BEGIN (?:(?:RSA |EC |OPENSSH |DSA |ENCRYPTED )?PRIVATE KEY|PGP PRIVATE KEY BLOCK)-----")

@@ -15,6 +15,33 @@ import preflight
 
 
 class PreflightTests(unittest.TestCase):
+    def test_aws_temporary_access_ids_have_exact_length_and_identifier_boundaries(self):
+        value = "AS" + "IA" + "Q7D2M5C4V6B3N2AZ"
+        for before, after in (("", ""), ('"', '"'), ("[", "]"), ("prefix-", "/next"), ("\n", "\r\n")):
+            found = [item for item in preflight.scan_bytes("capture.txt", (before + value + after).encode()) if item.rule == "credential-token"]
+            self.assertEqual(len(found), 1)
+            self.assertEqual(found[0].fingerprint, preflight.finding("credential-token", "capture.txt", 1, value).fingerprint)
+            self.assertNotIn(value, json.dumps([preflight.asdict(item) for item in found]))
+        for candidate in (value[:-1], value + "A", value + "a", value + "_", "x" + value, "_" + value,
+                          "\u03b1" + value, value[:-1] + "z", value[:8] + "_" + value[9:], "asia" + value[4:]):
+            self.assertFalse(any(item.rule == "credential-token" for item in preflight.scan_bytes("capture.txt", candidate.encode())), len(candidate))
+
+    def test_removed_aws_temporary_access_id_is_redacted_in_history(self):
+        value = "AS" + "IA" + "Q7D2M5C4V6B3N2AZ"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = self.make_repository(root)
+            (root / "capture.txt").write_text(value + "\n")
+            run("add", ".")
+            run("commit", "-qm", "Temporary ID fixture")
+            (root / "capture.txt").write_text("clean\n")
+            run("add", ".")
+            run("commit", "-qm", "Remove temporary ID fixture")
+            findings = [item for path, data, revision in preflight.history_files(root)
+                        for item in preflight.scan_bytes(path, data, revision) if item.rule == "credential-token"]
+            self.assertEqual(len(findings), 1)
+            self.assertNotIn(value, json.dumps([preflight.asdict(item) for item in findings]))
+
     def test_overall_history_deadline_spans_successful_git_calls(self):
         now = [0.0]
         calls = []
@@ -57,6 +84,36 @@ class PreflightTests(unittest.TestCase):
                     self.assertEqual(len(found), 1)
                     self.assertEqual(found[0].fingerprint, preflight.finding("credential-assignment",path,1,value).fingerprint)
                     self.assertNotIn(value,json.dumps([preflight.asdict(item) for item in found]))
+
+    def test_unquoted_values_keep_embedded_hashes_and_ignore_inline_comments(self):
+        key, value = "API_" + "TOKEN", "synthetic" + "Value918"
+        for path in (".env.example", "settings.yml", "config.txt", "setup.sh"):
+            for actual in (value, value[:8] + "#" + value[8:]):
+                for comment in ("", " # rotate later", "\t# second comment"):
+                    with self.subTest(path=path, embedded_hash="#" in actual, comment=bool(comment)):
+                        text = key + "=" + actual + comment + "\r\n"
+                        found = [item for item in preflight.scan_bytes(path, text.encode()) if item.rule == "credential-assignment"]
+                        self.assertEqual(len(found), 1)
+                        self.assertEqual(found[0].fingerprint, preflight.finding("credential-assignment", path, 1, actual).fingerprint)
+                        self.assertNotIn(actual, json.dumps([preflight.asdict(item) for item in found]))
+        for text in (key + "=short # long comment text", key + "= # comment only", "# " + key + "=" + value):
+            self.assertEqual(preflight.scan_bytes("config.txt", text.encode()), [])
+
+    def test_commented_unquoted_value_is_found_in_removed_history(self):
+        key, value = "API_" + "TOKEN", "synthetic" + "History918"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = self.make_repository(root)
+            (root / "config.yml").write_text(key + ": " + value + " # rotate later\n")
+            run("add", ".")
+            run("commit", "-qm", "Commented synthetic fixture")
+            (root / "config.yml").write_text("clean: true\n")
+            run("add", ".")
+            run("commit", "-qm", "Remove synthetic fixture")
+            findings = [item for path, data, revision in preflight.history_files(root)
+                        for item in preflight.scan_bytes(path, data, revision) if item.rule == "credential-assignment"]
+            self.assertEqual(len(findings), 1)
+            self.assertEqual(findings[0].fingerprint, preflight.finding("credential-assignment", "config.yml", 1, value).fingerprint)
 
     def test_many_incomplete_export_lines_have_bounded_scan_time(self):
         script = "import preflight; unit=b'export TOKEN \\n'; data=(unit*(preflight.MAX_BYTES//len(unit)+1))[:preflight.MAX_BYTES]; assert preflight.scan_bytes('.profile',data) == []"
