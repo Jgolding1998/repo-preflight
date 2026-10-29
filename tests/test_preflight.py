@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -12,6 +13,17 @@ import preflight
 
 
 class PreflightTests(unittest.TestCase):
+    def test_email_after_a_long_separator_or_artifact_prefix_is_detected(self):
+        suffix = "ops.team" + chr(64) + "example.org"
+        for prefix in ("-" * 70, "build-artifact-v1.2.3-release-candidate-final-final-2-notify-"):
+            with self.subTest(prefix=prefix[:10]):
+                self.assertIn("email", [item.rule for item in preflight.scan_bytes("log.txt", (prefix + suffix).encode())])
+
+    def test_long_hyphenated_input_has_bounded_scan_time(self):
+        script = "import preflight; assert preflight.scan_bytes('long.txt', b'a-' * 1000000) == []"
+        result = subprocess.run([sys.executable, "-c", script], cwd=Path(__file__).resolve().parents[1], capture_output=True, timeout=8)
+        self.assertEqual(result.returncode, 0)
+
     def test_repository_git_executable_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
