@@ -477,7 +477,7 @@ class PreflightTests(unittest.TestCase):
             (root / "nested").mkdir()
             (root / "real.txt").write_text("hello")
             self.assertEqual(list(preflight.current_files(root / "nested" / "..", False)),
-                             [("real.txt", b"hello")])
+                             [("real.txt", b"hello", "")])
 
     def test_skipped_directories_are_not_traversed(self):
         with tempfile.TemporaryDirectory() as directory:
