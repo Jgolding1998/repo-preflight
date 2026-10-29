@@ -126,7 +126,8 @@ def git(root: Path, *args: str, deadline: float | None = None, input: bytes | No
     if timeout <= 0:
         raise HistoryScanError("History deadline reached. The scan is incomplete; reduce the scope and rerun.")
     stdin = subprocess.DEVNULL if input is None else subprocess.PIPE
-    with subprocess.Popen(command, stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=environment) as process:
+    with subprocess.Popen(command, stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=environment,
+                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)) as process:
         def stop():
             try:
                 process.kill()
@@ -222,6 +223,30 @@ def is_link(path: Path, *, info=None) -> bool:
     return False
 
 
+def history_paths(data: bytes) -> dict[bytes, set[str]]:
+    fields = data.split(b"\0")
+    if fields[-1] != b"" or len(fields) % 2 != 1:
+        raise ValueError("Git path history is incomplete")
+    paths: dict[bytes, set[str]] = {}
+    count = 0
+    header = re.compile(rb":[0-7]{6} [0-7]{6} ([0-9a-f]{40}|[0-9a-f]{64}) ([0-9a-f]{40}|[0-9a-f]{64}) [ADMT]")
+    for index in range(0, len(fields) - 1, 2):
+        match = header.fullmatch(fields[index].lstrip(b"\n"))
+        if match is None or not fields[index + 1]:
+            raise ValueError("Git path history is incomplete")
+        name = fields[index + 1].decode("utf-8")
+        for oid in match.groups():
+            if not oid.strip(b"0"):
+                continue
+            names = paths.setdefault(oid, set())
+            if name not in names:
+                names.add(name)
+                count += 1
+                if count > MAX_HISTORY_OBJECTS:
+                    raise HistoryScanError("History exceeds the path-count limit. Reduce the scan scope and rerun.")
+    return paths
+
+
 def history_files(root: Path):
     deadline = time.monotonic() + HISTORY_TIMEOUT
     def check_deadline():
@@ -250,6 +275,7 @@ def history_files(root: Path):
     checks = read("cat-file", "--batch-check", "--buffer", input=b"".join(oid + b"\n" for oid, _ in entries)).split(b"\n")
     if len(checks) != len(entries) + 1 or checks[-1] != b"":
         raise ValueError("Git object check is incomplete")
+    paths = history_paths(read("log", "--all", "--root", "-m", "--no-renames", "--raw", "-z", "--format=", "--no-abbrev", "--no-ext-diff", "--no-textconv", "--no-color"))
     selected = []
     scanned_bytes = 0
     for (oid, name), check in zip(entries, checks):
@@ -259,13 +285,14 @@ def history_files(root: Path):
         kind, size = fields[1], int(fields[2])
         if kind not in {b"blob", b"commit", b"tag"}:
             continue
-        path = name or "[unnamed-blob]"
-        if kind != b"blob":
-            path = "[commit-metadata].txt" if kind == b"commit" else "[tag-metadata].txt"
-        scanned_bytes += min(size, MAX_BYTES + 1)
-        if scanned_bytes > MAX_HISTORY_BYTES:
-            raise HistoryScanError("History exceeds the byte budget. Reduce the scan scope and rerun.")
-        selected.append((oid, kind, size, path))
+        names = sorted(paths.get(oid, set()) | {name or "[unnamed-blob]"}) if kind == b"blob" else ["[commit-metadata].txt" if kind == b"commit" else "[tag-metadata].txt"]
+        for path in names:
+            scanned_bytes += min(size, MAX_BYTES + 1)
+            if scanned_bytes > MAX_HISTORY_BYTES:
+                raise HistoryScanError("History exceeds the byte budget. Reduce the scan scope and rerun.")
+            if len(selected) >= MAX_HISTORY_OBJECTS:
+                raise HistoryScanError("History exceeds the path-count limit. Reduce the scan scope and rerun.")
+            selected.append((oid, kind, size, path))
     start = 0
     while start < len(selected):
         end, output = start, 0

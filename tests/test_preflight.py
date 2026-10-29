@@ -73,6 +73,7 @@ class PreflightTests(unittest.TestCase):
                 process.poll.return_value = 0
                 self.assertEqual(preflight.git(Path(directory).resolve(),"rev-parse",deadline=103), b"")
                 self.assertEqual(timer.call_args.args[0], 3)
+                self.assertEqual(launch.call_args.kwargs["creationflags"], getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
     def test_exported_environment_and_profile_values_are_complete_and_redacted(self):
         value = "fixture-private-123456789"
@@ -130,6 +131,72 @@ class PreflightTests(unittest.TestCase):
         run("add", ".")
         run("commit", "-qm", "Initial fixture")
         return run
+
+    def test_renamed_environment_blob_keeps_its_original_path_sensitive_findings(self):
+        value = "synthetic" + "Value84A72"
+        key = "API_" + "TOKEN"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = self.make_repository(root)
+            (root / ".env").write_text(key + "=" + value + "\n")
+            run("add", ".")
+            run("commit", "-qm", "Add environment fixture")
+            run("mv", ".env", "env-notes.md")
+            run("commit", "-qm", "Rename unchanged fixture")
+            findings = [item for name, data, revision in preflight.history_files(root)
+                        for item in preflight.scan_bytes(name, data, revision)]
+            self.assertIn(("environment-file", ".env"), [(item.rule, item.path) for item in findings])
+            self.assertIn(("credential-assignment", ".env"), [(item.rule, item.path) for item in findings])
+            self.assertNotIn(value, json.dumps([preflight.asdict(item) for item in findings]))
+
+    def test_identical_blob_is_checked_at_each_config_path_without_widening_exceptions(self):
+        value = "synthetic" + "Value93B61"
+        key = "API_" + "TOKEN"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = self.make_repository(root)
+            for name in ("a-notes.md", ".env.production", "settings.cfg"):
+                (root / name).write_text(key + "=" + value + "\n")
+            run("add", ".")
+            run("commit", "-qm", "Shared content fixture")
+            findings = [item for name, data, revision in preflight.history_files(root)
+                        for item in preflight.scan_bytes(name, data, revision) if item.rule == "credential-assignment"]
+            self.assertEqual({item.path for item in findings}, {".env.production", "settings.cfg"})
+            selected = next(item for item in findings if item.path == ".env.production")
+            exceptions = [{"rule": selected.rule, "path": selected.path, "fingerprint": selected.fingerprint, "reason": "Owned fixture"}]
+            self.assertEqual([item.path for item in findings if not preflight.allowed(item, exceptions)], ["settings.cfg"])
+
+    def test_history_aliases_preserve_raw_path_controls_and_reject_truncated_records(self):
+        oid = b"ab" * 20
+        name = "odd\nname\t.env"
+        record = b":000000 100644 " + b"0" * 40 + b" " + oid + b" A\0" + name.encode() + b"\0"
+        self.assertEqual(preflight.history_paths(record), {oid: {name}})
+        for malformed in (record[:-1], record.split(b"\0", 1)[0] + b"\0", b"not a raw header\0path\0"):
+            with self.subTest(size=len(malformed)), self.assertRaises(ValueError):
+                preflight.history_paths(malformed)
+
+    def test_history_alias_count_has_a_separate_bounded_expansion(self):
+        oid = b"ab" * 20
+        record = b":000000 100644 " + b"0" * 40 + b" " + oid + b" A\0"
+        data = b"".join(record + str(index).encode() + b".txt\0" for index in range(4))
+        with mock.patch.object(preflight, "MAX_HISTORY_OBJECTS", 3), self.assertRaises(preflight.HistoryScanError):
+            preflight.history_paths(data)
+
+    def test_tagged_tree_preserves_path_evidence_outside_commit_diffs(self):
+        value = "synthetic" + "Value46C28"
+        key = "API_" + "TOKEN"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = self.make_repository(root)
+            (root / "notes.md").write_text(key + "=" + value + "\n")
+            run("add", ".")
+            run("commit", "-qm", "Document fixture")
+            blob = run("rev-parse", "HEAD:notes.md").decode().strip()
+            tree = run("mktree", data=f"100644 blob {blob}\t.env\n".encode()).decode().strip()
+            run("tag", "tree-fixture", tree)
+            found = self.scan_history(root)
+            self.assertIn(("environment-file", ".env", blob), found)
+            self.assertIn(("credential-assignment", ".env", blob), found)
 
     def test_graft_file_cannot_hide_an_ancestor(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -221,7 +288,7 @@ class PreflightTests(unittest.TestCase):
             with mock.patch.object(preflight, "git", side_effect=counting):
                 expected = self.scan_history(root)
             self.assertIn("credential-token", [rule for rule, _, _ in expected])
-            self.assertEqual(len(calls), 4)
+            self.assertEqual(len(calls), 5)
             calls.clear()
             with mock.patch.object(preflight, "git", side_effect=counting), mock.patch.object(preflight, "MAX_GIT_OUTPUT", 8192):
                 self.assertEqual(self.scan_history(root), expected)
@@ -240,7 +307,7 @@ class PreflightTests(unittest.TestCase):
 
     def test_incomplete_batch_output_fails_closed(self):
         oid = b"cd" * 20
-        replies = {"rev-parse": b"false\n", "rev-list": oid + b" a.txt\n", "--batch-check": oid + b" blob 10\n", "--batch": oid + b" blob 10\nshort\n"}
+        replies = {"rev-parse": b"false\n", "rev-list": oid + b" a.txt\n", "log": b"", "--batch-check": oid + b" blob 10\n", "--batch": oid + b" blob 10\nshort\n"}
         def fake_git(root, *args, deadline=None, input=None):
             return replies[args[1] if args[0] == "cat-file" else args[0]]
         with tempfile.TemporaryDirectory() as directory, mock.patch.object(preflight, "git", side_effect=fake_git):
