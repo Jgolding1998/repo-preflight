@@ -37,7 +37,7 @@ QUOTED_VALUE = r'''(?:"([^"\\\r\n]*+(?:\\[^\r\n][^"\\\r\n]*+)*+)"|'([^'\\\r\n]*+
 ASSIGNMENT = re.compile(r"[\"']?" + FIELD_PATTERN + r"[\"']?\]?\s*(?::[ \t]*[A-Za-z_][\w.\[\]| \t]{0,64}?=|:=|=>|[:=])\s*(?:\(\s*)?" + QUOTED_VALUE, re.I)
 ENV_ASSIGNMENT = re.compile(r"^[ \t]*(?:export[ \t]+)?" + FIELD_PATTERN + r"[ \t]*[:=][ \t]*([^\s\"'#$({][^\s;]{7,}+)(?:[ \t]+#[^\r\n]*)?[ \t\r]*$", re.I | re.M)
 SHELL_ASSIGNMENT = re.compile(r"^[ \t]*(?:export[ \t]+)?" + FIELD_PATTERN
-                              + r'''=((?![#$({`])(?:\\[^\r\n]|[^\s\\"'`$(){};&|<>])++)(?=[ \t]*;)''', re.I | re.M)
+                              + r'''=((?![#$({`])(?:\\[^\r\n]|[^\s\\"'`$(){};&|<>])++)(?=[ \t]*(?:;|&&|\|\||&))''', re.I | re.M)
 SHELL_NAMES = {".profile", ".bash_profile", ".bashrc", ".zprofile", ".zshrc"}
 FALLBACK = re.compile(FIELD_PATTERN + r"\s*=\s*(?:process\.env\.[A-Z0-9_]+|os\.environ\.get\([^()\r\n]{0,1024}\)|os\.getenv\([^()\r\n]{0,1024}\))\s*(?:\|\||or)\s*" + QUOTED_VALUE, re.I)
 PLACEHOLDER = re.compile(r"^(?:your[-_ ].*|replace[-_ ].*|example|example[-_ ].*|placeholder|placeholder[-_ ].*|changeme|<.*>|\$\{.*\}|test[-_ ].*)$", re.I)
@@ -78,7 +78,18 @@ def scan_bytes(path: str, data: bytes, revision: str = "", terms: tuple[str, ...
         elif b"\0" in data:
             if path in {"[commit-metadata].txt", "[tag-metadata].txt"}:
                 return output + [finding("unreadable-text", path, 0, hashlib.sha256(data).hexdigest(), revision)]
-            return output
+            try:
+                content = data.decode("utf-8-sig")
+            except UnicodeDecodeError:
+                # Recognizable ASCII secrets remain detectable in binary data.
+                content = data.decode("latin-1")
+                for rule, pattern in (("credential-token", TOKEN), ("private-key", PRIVATE_KEY)):
+                    line, previous = 1, 0
+                    for match in pattern.finditer(content):
+                        line += data.count(b"\n", previous, match.start())
+                        previous = match.start()
+                        output.append(finding(rule, path, line, match.group(), revision))
+                return output
         else:
             content = data.decode("utf-8-sig")
     except UnicodeDecodeError:
