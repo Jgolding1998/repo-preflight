@@ -1,0 +1,11 @@
+{
+  "blocked_terms": [],
+  "allow": [
+    {
+      "rule": "credential-assignment",
+      "path": "tests/test_preflight.py",
+      "fingerprint": "fceb9c1ea3ae638df145",
+      "reason": "This exact literal concatenation builds a synthetic credential regression fixture; it is not a usable credential."
+    }
+  ]
+}

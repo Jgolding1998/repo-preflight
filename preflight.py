@@ -33,9 +33,10 @@ TOKEN = re.compile(r"(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{30,}|
 FIELD_PATTERN = (r"(?<![\w-])(?=[a-z0-9_-]{0," + str(MAX_FIELD_NAME - 1)
                  + r"}(?:api[_-]?key|token|password|secret|credential))"
                  + r"[a-z0-9_-]{1," + str(MAX_FIELD_NAME) + r"}(?![\w-])")
-ASSIGNMENT = re.compile(r"[\"']?" + FIELD_PATTERN + r"[\"']?\s*[:=]\s*(?:\(\s*)?[\"']([^\"'\r\n]{8,})[\"']", re.I)
+QUOTED_VALUE = r'''(?:"([^"\\\r\n]*+(?:\\[^\r\n][^"\\\r\n]*+)*+)"|'([^'\\\r\n]*+(?:\\[^\r\n][^'\\\r\n]*+)*+)')'''
+ASSIGNMENT = re.compile(r"[\"']?" + FIELD_PATTERN + r"[\"']?\]?\s*(?::[ \t]*[A-Za-z_][\w.\[\]| \t]{0,64}?=|:=|=>|[:=])\s*(?:\(\s*)?" + QUOTED_VALUE, re.I)
 ENV_ASSIGNMENT = re.compile(r"^[ \t]*(?:export[ \t]+)?" + FIELD_PATTERN + r"[ \t]*[:=][ \t]*([^\s\"'#$({][^\s#;]{7,})[ \t\r]*$", re.I | re.M)
-FALLBACK = re.compile(FIELD_PATTERN + r"\s*=\s*(?:process\.env\.[A-Z0-9_]+|os\.environ\.get\([^()\r\n]{0,1024}\)|os\.getenv\([^()\r\n]{0,1024}\))\s*(?:\|\||or)\s*[\"']([^\"'\r\n]{8,})[\"']", re.I)
+FALLBACK = re.compile(FIELD_PATTERN + r"\s*=\s*(?:process\.env\.[A-Z0-9_]+|os\.environ\.get\([^()\r\n]{0,1024}\)|os\.getenv\([^()\r\n]{0,1024}\))\s*(?:\|\||or)\s*" + QUOTED_VALUE, re.I)
 PLACEHOLDER = re.compile(r"^(?:your[-_ ].*|replace[-_ ].*|example|example[-_ ].*|placeholder|placeholder[-_ ].*|changeme|<.*>|\$\{.*\}|test[-_ ].*)$", re.I)
 PRIVATE_KEY = re.compile(r"-----BEGIN (?:(?:RSA |EC |OPENSSH |DSA |ENCRYPTED )?PRIVATE KEY|PGP PRIVATE KEY BLOCK)-----")
 
@@ -65,7 +66,7 @@ def scan_bytes(path: str, data: bytes, revision: str = "", terms: tuple[str, ...
     if (base == ".env" or base.startswith(".env.")) and not base.endswith((".example", ".template", ".sample")):
         output.append(finding("environment-file", path, 0, path, revision))
     if len(data) > MAX_BYTES:
-        return output + [finding("oversized-file", path, 0, str(len(data)), revision)]
+        return output + [finding("oversized-file", path, 0, revision or hashlib.sha256(data).hexdigest(), revision)]
     try:
         if data.startswith((b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff")):
             content = data.decode("utf-32")
@@ -73,12 +74,12 @@ def scan_bytes(path: str, data: bytes, revision: str = "", terms: tuple[str, ...
             content = data.decode("utf-16")
         elif b"\0" in data:
             if path in {"[commit-metadata].txt", "[tag-metadata].txt"}:
-                return output + [finding("unreadable-text", path, 0, path, revision)]
+                return output + [finding("unreadable-text", path, 0, hashlib.sha256(data).hexdigest(), revision)]
             return output
         else:
             content = data.decode("utf-8-sig")
     except UnicodeDecodeError:
-        return output + [finding("unreadable-text", path, 0, path, revision)]
+        return output + [finding("unreadable-text", path, 0, hashlib.sha256(data).hexdigest(), revision)]
     for number, line in enumerate(content.splitlines(), 1):
         for rule, pattern in (("credential-token", TOKEN), ("private-key", PRIVATE_KEY), ("email", EMAIL), ("personal-path", PERSONAL_PATH)):
             candidate = line.replace("\\\\", "\\").replace("\\/", "/") if rule == "personal-path" else line
@@ -97,6 +98,10 @@ def scan_bytes(path: str, data: bytes, revision: str = "", terms: tuple[str, ...
     for pattern in patterns:
         for match in pattern.finditer(content):
             value = match.group(1)
+            if value is None:
+                value = match.group(2)
+            if len(value) < 8:
+                continue
             if re.match(r"[\"']?credentials[\"']?\s*:", match.group(), re.I) and value in {"same-origin", "omit", "include"}:
                 continue
             if not PLACEHOLDER.fullmatch(value) and not value.startswith(("os.environ", "process.env")):
@@ -166,12 +171,28 @@ def current_files(root: Path, tracked: bool):
         paths = [root / name for name in names if name]
     else:
         paths = walk_files(root)
+    directories = {}
     for path in paths:
         relative = path.relative_to(root)
-        if any(part in SKIP_DIRS for part in relative.parts) or path.is_symlink():
+        if any(part in SKIP_DIRS for part in relative.parts):
             continue
-        if path.is_file():
-            if not path.resolve().is_relative_to(root):
+        if tracked:
+            parent = root
+            linked = False
+            for part in relative.parts[:-1]:
+                parent = parent / part
+                if parent not in directories:
+                    directories[parent] = is_link(parent)
+                if directories[parent]:
+                    linked = True
+                    break
+            if linked:
+                continue
+        info = os.lstat(path)
+        if is_link(path, info=info):
+            continue
+        if stat.S_ISREG(info.st_mode):
+            if not path.resolve(strict=True).is_relative_to(root):
                 continue
             with path.open("rb") as stream:
                 data = stream.read(MAX_BYTES + 1)
@@ -188,8 +209,9 @@ def walk_files(root: Path):
             yield base / name
 
 
-def is_link(path: Path) -> bool:
-    info = os.lstat(path)
+def is_link(path: Path, *, info=None) -> bool:
+    if info is None:
+        info = os.lstat(path)
     if stat.S_ISLNK(info.st_mode):
         return True
     if getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT:
@@ -341,7 +363,8 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"scanned": count, "findings": [asdict(item) for item in found]}, indent=2))
     else:
         for item in found:
-            print(f"{item.path}:{item.line} {item.rule} [{item.fingerprint}]" + (f" blob={item.revision}" if item.revision else ""))
+            display_path = json.dumps(item.path, ensure_ascii=True)[1:-1]
+            print(f"{display_path}:{item.line} {item.rule} [{item.fingerprint}]" + (f" blob={item.revision}" if item.revision else ""))
         print(f"Scanned {count} files/objects. {len(found)} findings. Matched values are never printed.")
     return 1 if found else 0
 

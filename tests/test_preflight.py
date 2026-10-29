@@ -404,6 +404,45 @@ class PreflightTests(unittest.TestCase):
         self.assertTrue(preflight.allowed(item, [entry]))
         self.assertFalse(preflight.allowed(preflight.finding("email", "b.txt", 1, "synthetic"), [entry]))
 
+    def test_unscanned_content_exceptions_are_bound_to_the_content(self):
+        token = ("gh" + "p_" + "A" * 36).encode()
+        for path, first, second, revision in (("legacy.txt", b"\xffreviewed", b"\xff" + token, ""),
+                                              ("[commit-metadata].txt", b"reviewed\0", token + b"\0", "1" * 40),
+                                              ("big.json", b"x" * (preflight.MAX_BYTES + 1), (token * (preflight.MAX_BYTES // len(token) + 1))[:preflight.MAX_BYTES + 1], "")):
+            with self.subTest(path=path):
+                reviewed, changed = preflight.scan_bytes(path, first, revision)[0], preflight.scan_bytes(path, second, revision)[0]
+                entry = {"rule": reviewed.rule, "path": path, "fingerprint": reviewed.fingerprint, "reason": "Synthetic fixture"}
+                self.assertTrue(preflight.allowed(reviewed, [entry]))
+                self.assertFalse(preflight.allowed(changed, [entry]))
+        placeholder = b"x" * (preflight.MAX_BYTES + 1)
+        self.assertNotEqual(preflight.scan_bytes("big.json", placeholder, "1" * 40)[0].fingerprint, preflight.scan_bytes("big.json", placeholder, "2" * 40)[0].fingerprint)
+        with tempfile.TemporaryDirectory() as directory:
+            root, config = Path(directory) / "repo", Path(directory) / "rules.json"
+            root.mkdir()
+            (root / "legacy.txt").write_bytes(b"\xffreviewed")
+            reviewed = preflight.scan_bytes("legacy.txt", b"\xffreviewed")[0]
+            config.write_text(json.dumps({"allow": [{"rule": reviewed.rule, "path": reviewed.path, "fingerprint": reviewed.fingerprint, "reason": "Synthetic fixture"}]}))
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(preflight.main([str(root), "--config", str(config)]), 0)
+                (root / "legacy.txt").write_bytes(b"\xff" + token)
+                self.assertEqual(preflight.main([str(root), "--config", str(config)]), 1)
+
+    def test_typed_short_declaration_hash_and_subscript_assignments(self):
+        value = '"synthetic-private-value"'
+        key = "pass" + "word"
+        for sample in (key + ": str = " + value, "const api" + "Key: string = " + value, key + ": Optional[str] = " + value, key + " := " + value,
+                       "'" + key + "' => " + value, 'cfg["' + key + '"] = ' + value):
+            with self.subTest(sample=sample[:16]):
+                self.assertIn("credential-assignment", [item.rule for item in preflight.scan_bytes("a.py", sample.encode())])
+        for sample in ("def login(" + key + ": str, mode=" + value + "):", key + ": str\nlabel = " + value, 'if cfg["' + key + '"] == ' + value + ":"):
+            with self.subTest(sample=sample[:16]):
+                self.assertNotIn("credential-assignment", [item.rule for item in preflight.scan_bytes("a.py", sample.encode())])
+
+    def test_typed_assignment_prefixes_have_bounded_scan_time(self):
+        script = "import preflight; unit=b'token: ' + b'a' * 70 + b' |'; data=(unit * (preflight.MAX_BYTES // len(unit) + 1))[:preflight.MAX_BYTES]; assert preflight.scan_bytes('long.txt', data) == []"
+        result = subprocess.run([sys.executable, "-c", script], cwd=Path(__file__).resolve().parents[1], capture_output=True, timeout=12)
+        self.assertEqual(result.returncode, 0)
+
     def test_cli_exit_codes_and_config_error(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -504,6 +543,115 @@ class PreflightTests(unittest.TestCase):
             with mock.patch.object(os, "scandir", side_effect=denied), contextlib.redirect_stderr(errors), contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(preflight.main([directory]), 2)
             self.assertNotIn("synthetic-private-value", errors.getvalue())
+
+    def test_unknown_file_reparse_points_make_current_scans_incomplete(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            (root / "source.txt").write_text("fixture")
+            real_lstat = os.lstat
+            def placeholder(path, *args, **kwargs):
+                if Path(path).name == "source.txt":
+                    return SimpleNamespace(st_mode=stat.S_IFREG | 0o644, st_file_attributes=stat.FILE_ATTRIBUTE_REPARSE_POINT, st_reparse_tag=0x9000001A)
+                return real_lstat(path, *args, **kwargs)
+            for tracked in (False, True):
+                with self.subTest(tracked=tracked), mock.patch.object(os,"lstat",side_effect=placeholder), \
+                        mock.patch.object(preflight,"git",return_value=b"source.txt\0"), \
+                        contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(preflight.main([directory] + (["--tracked"] if tracked else [])),2)
+
+    def test_unreadable_file_attributes_make_current_scans_incomplete(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            (root / "source.txt").write_text("fixture")
+            real_lstat = os.lstat
+            def denied(path, *args, **kwargs):
+                if Path(path).name == "source.txt":
+                    raise PermissionError(13,"synthetic denied")
+                return real_lstat(path, *args, **kwargs)
+            for tracked in (False, True):
+                with self.subTest(tracked=tracked), mock.patch.object(os,"lstat",side_effect=denied), \
+                        mock.patch.object(preflight,"git",return_value=b"source.txt\0"), \
+                        contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(preflight.main([directory] + (["--tracked"] if tracked else [])),2)
+
+    def test_tracked_parent_reparse_checks_are_cached_and_fail_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            (root / "cloud").mkdir()
+            for name in ("one.txt","two.txt"):
+                (root / "cloud" / name).write_text("fixture")
+            real_lstat = os.lstat
+            for tag, expected in ((0xA0000003,0),(0x9000001A,2)):
+                checked = []
+                def reparse(path, *args, **kwargs):
+                    if Path(path).name == "cloud":
+                        checked.append(path)
+                        return SimpleNamespace(st_mode=stat.S_IFDIR | 0o755, st_file_attributes=stat.FILE_ATTRIBUTE_REPARSE_POINT, st_reparse_tag=tag)
+                    return real_lstat(path,*args,**kwargs)
+                with self.subTest(tag=tag), mock.patch.object(os,"lstat",side_effect=reparse), \
+                        mock.patch.object(preflight,"git",return_value=b"cloud/one.txt\0cloud/two.txt\0"), \
+                        mock.patch.object(Path,"open",side_effect=AssertionError("linked source must not be opened")), \
+                        contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(preflight.main([directory,"--tracked"]),expected)
+                self.assertEqual(len(checked),1)
+
+    def test_unstaged_tracked_deletion_is_incomplete_but_staged_deletion_is_clean(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            run = self.make_repository(root)
+            (root / "a.txt").unlink()
+            with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(preflight.main([directory,"--tracked"]),2)
+                run("add","-u")
+                self.assertEqual(preflight.main([directory,"--tracked"]),0)
+
+    def test_mixed_and_escaped_quotes_bind_exceptions_to_the_full_literal(self):
+        field = "pass" + "word"
+        for quote, other in ((chr(34),chr(39)),(chr(39),chr(34))):
+            for prefix in ("abc","prefixeight"):
+                for middle in (other,"\\"+quote):
+                    values = [prefix+middle+suffix for suffix in ("old-private-tail","new-private-tail")]
+                    found = []
+                    for value in values:
+                        literal = field+" = "+quote+value+quote
+                        matches = [item for item in preflight.scan_bytes("fixture.py",literal.encode()) if item.rule == "credential-assignment"]
+                        self.assertEqual(len(matches),1)
+                        self.assertEqual(matches[0].fingerprint,preflight.finding("credential-assignment","fixture.py",1,value).fingerprint)
+                        self.assertNotIn(value,json.dumps(preflight.asdict(matches[0])))
+                        found.append(matches[0])
+                    self.assertNotEqual(found[0].fingerprint,found[1].fingerprint)
+
+    def test_environment_fallback_quotes_cover_the_complete_value(self):
+        field = "api" + "_key"
+        for value in ("abc'synthetic-private-tail",'abc\\"synthetic-private-tail'):
+            text = field+" = os.getenv('PROVIDER_VALUE') or "+chr(34)+value+chr(34)
+            found = [item for item in preflight.scan_bytes("fixture.py",text.encode()) if item.rule == "credential-assignment"]
+            self.assertEqual(len(found),1)
+            self.assertEqual(found[0].fingerprint,preflight.finding("credential-assignment","fixture.py",1,value).fingerprint)
+        for value in ("","short","1234567"):
+            self.assertEqual(preflight.scan_bytes("fixture.py",(field+" = "+chr(34)+value+chr(34)).encode()),[])
+
+    def test_long_escaped_and_unterminated_literals_have_bounded_scan_time(self):
+        script = "import preflight; prefix=b'pass'+b'word = '+bytes([34]); escaped=(bytes([92])+b'a')*((preflight.MAX_BYTES-len(prefix)-1)//2); data=prefix+escaped; assert preflight.scan_bytes('fixture.py',data)==[]; data+=bytes([34]); assert any(x.rule=='credential-assignment' for x in preflight.scan_bytes('fixture.py',data))"
+        result = subprocess.run([sys.executable,"-c",script],cwd=Path(__file__).resolve().parents[1],capture_output=True,timeout=12)
+        self.assertEqual(result.returncode,0)
+
+    def test_text_reports_escape_terminal_controls_but_json_keeps_exact_paths(self):
+        name = "fixture"+chr(27)+"[2J"+chr(10)+"report.txt"
+        value = ("gh"+"p_"+"A"*24).encode()
+        with tempfile.TemporaryDirectory() as directory:
+            for as_json in (False,True):
+                output = io.StringIO()
+                with mock.patch.object(preflight,"current_files",return_value=iter([(name,value,"")])), contextlib.redirect_stdout(output):
+                    self.assertEqual(preflight.main([directory]+(["--json"] if as_json else [])),1)
+                report = output.getvalue()
+                self.assertNotIn(chr(27),report)
+                self.assertNotIn(value.decode(),report)
+                if as_json:
+                    self.assertEqual(json.loads(report)["findings"][0]["path"],name)
+                else:
+                    self.assertEqual(len(report.splitlines()),2)
+                    self.assertIn("\\u001b[2J\\nreport.txt",report)
 
     def test_history_detects_removed_value(self):
         with tempfile.TemporaryDirectory() as directory:

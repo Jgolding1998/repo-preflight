@@ -16,7 +16,7 @@ Exit codes: `0` clean, `1` findings, `2` incomplete scan. CI should fail for bot
 
 | Rule | Why it matters |
 | --- | --- |
-| Credential tokens and assignments | Common provider keys, quoted JSON keys, multiline literals, and common environment fallback patterns |
+| Credential tokens and assignments | Common provider keys, quoted JSON keys, typed, `:=`, `=>` and subscript assignments, multiline literals, and common environment fallback patterns |
 | Private key headers | A private key should never be a fixture or source asset |
 | Emails and personal home paths | Easy-to-miss identity leaks in examples and scripts |
 | Environment files | Real `.env` files belong outside version control |
@@ -25,9 +25,11 @@ Exit codes: `0` clean, `1` findings, `2` incomplete scan. CI should fail for bot
 
 ## Narrow exceptions
 
-Use `--config rules.json` for `blocked_terms` and an `allow` list. Every exception needs an exact `rule`, `path`, `fingerprint`, and a written `reason`. Copy only the fingerprint from a redacted report. Exceptions do not support glob paths. Changing the matched value invalidates its exception.
+Use `--config rules.json` for `blocked_terms` and an `allow` list. Every exception needs an exact `rule`, `path`, `fingerprint`, and a written `reason`. Copy only the fingerprint from a redacted report. Exceptions do not support glob paths. Changing the matched value invalidates its exception. For unreadable and oversized files the matched value is the content itself: unreadable text uses a content hash, a historical oversized object uses its object ID, and an oversized working file hashes only its first 2 MiB plus one byte, so a change past that point keeps the exception.
 
 Config files accept only these two fields, reject duplicate keys, and are limited to 2 MiB, 128 blocked terms and 4,096 exceptions. History traversal ignores replacement objects and graft files.
+
+This repository uses `--config preflight-rules.json` for its self-scan. It allows one exact synthetic test literal that also appears in earlier revisions. Review and replace that exception list when adopting the tool for another repository.
 
 ```json
 {"blocked_terms": [], "allow": []}
@@ -35,7 +37,9 @@ Config files accept only these two fields, reject duplicate keys, and are limite
 
 ## Design choices
 
-Rules return immutable findings, separate from reporting and file discovery. UTF-8 and BOM-marked UTF-16/UTF-32 text are supported. Escaped Windows paths in JSON are normalized for detection. Current-tree mode skips dependency folders, symlinks and Windows junctions without descending into them. An unreadable directory, unreadable link attribute or unsupported reparse point exits `2`. Use a fully local checkout if cloud placeholder folders prevent a complete scan.
+Rules return immutable findings, separate from reporting and file discovery. UTF-8 and BOM-marked UTF-16/UTF-32 text are supported. Escaped Windows paths in JSON are normalized for detection. Current-tree mode skips dependency folders, symlinks and Windows junctions without descending into them. An unreadable directory, unreadable file attribute or unsupported file or directory reparse point exits `2`. Tracked mode also checks parent directories and treats a missing indexed file as incomplete; stage an intentional deletion before scanning. Use a fully local checkout if cloud placeholder folders prevent a complete scan.
+
+Tracked mode reads working files, not staged index contents, and requires a full working tree rather than a sparse checkout. It does not descend into submodules or directories that replace indexed files. Quoted source construction can also look like a credential literal; review such findings before creating an exact exception.
 
 Git commands use argument arrays, never a shell. Inherited `GIT_*` variables are removed, global and system configuration are ignored, and filesystem-monitor helpers, signature verification and hooks are disabled. Lazy fetching and Git transport protocols are disabled, so missing objects fail the scan without running a remote helper. Repository-local configuration, including its includes, is still read. The scanner reads raw objects without checkout filters and does not modify the repository.
 
@@ -51,5 +55,7 @@ This is a fast hygiene check, not a replacement for [Gitleaks](https://github.co
 2. Scan history and run a dedicated secret scanner before publication.
 3. Review each finding, remove the cause, and rerun the check.
 4. Rotate any credential that was committed. Deleting the source line does not revoke it.
+
+Text reports escape control and non-ASCII characters in filenames so a captured path cannot rewrite terminal output. Parse JSON reports to recover exact filenames for tooling or exceptions.
 
 Tests use temporary repositories and synthetic values assembled in memory. They verify redaction, removed history, graft and replacement handling, tagged blobs, commit and tag metadata, shallow clones, scan budgets, exported environment assignments, malformed configuration, exact exceptions and bounded adversarial inputs. No production credentials are used.
