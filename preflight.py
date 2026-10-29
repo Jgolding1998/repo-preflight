@@ -62,7 +62,7 @@ def finding(rule: str, path: str, line: int, value: str, revision: str = "") -> 
     return Finding(rule, path, line, digest, revision)
 
 
-def scan_bytes(path: str, data: bytes, revision: str = "", terms: tuple[str, ...] = ()) -> list[Finding]:
+def scan_bytes(path: str, data: bytes, revision: str = "", terms: tuple[str, ...] = (), *, check_style: bool = False) -> list[Finding]:
     output: list[Finding] = []
     folded_terms = tuple(term.casefold() for term in terms)
     base = Path(path).name.lower()
@@ -99,7 +99,7 @@ def scan_bytes(path: str, data: bytes, revision: str = "", terms: tuple[str, ...
             candidate = line.replace("\\\\", "\\").replace("\\/", "/") if rule == "personal-path" else line
             for match in pattern.finditer(candidate):
                 output.append(finding(rule, path, number, match.group(), revision))
-        if chr(0x2014) in line:
+        if check_style and chr(0x2014) in line:
             output.append(finding("em-dash", path, number, line, revision))
         folded = line.casefold() if terms else ""
         for term in folded_terms:
@@ -380,6 +380,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--tracked", action="store_true", help="Scan only Git-tracked working files")
     parser.add_argument("--history", action="store_true", help="Also scan reachable Git blobs, commit metadata and annotated tags")
     parser.add_argument("--config", type=Path, help="JSON rules and exact fingerprint exceptions")
+    parser.add_argument("--check-style", action="store_true", help="Also report em dashes as writing-style findings")
     parser.add_argument("--json", action="store_true", dest="as_json")
     args = parser.parse_args(argv)
     try:
@@ -391,11 +392,11 @@ def main(argv: list[str] | None = None) -> int:
         count = 0
         for name, data, revision in current_files(root, args.tracked):
             count += 1
-            found.extend(scan_bytes(name, data, revision, terms))
+            found.extend(scan_bytes(name, data, revision, terms, check_style=args.check_style))
         if args.history:
             for name, data, revision in history_files(root):
                 count += 1
-                found.extend(scan_bytes(name, data, revision, terms))
+                found.extend(scan_bytes(name, data, revision, terms, check_style=args.check_style))
         found = list(dict.fromkeys(item for item in found if not allowed(item, exceptions)))
     except HistoryScanError as error:
         print(str(error), file=sys.stderr)

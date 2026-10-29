@@ -20,8 +20,11 @@ Exit codes: `0` clean, `1` findings, `2` incomplete scan. CI should fail for bot
 | Private key headers | A private key should never be a fixture or source asset |
 | Emails and personal home paths | Easy-to-miss identity leaks in examples and scripts |
 | Environment files | Real `.env` files belong outside version control |
-| Em dashes and configured terms | Consistent writing rules without changing code blindly |
+| Configured terms | Optional terms supplied explicitly in the rules file |
+| Em dashes (optional) | Enable the writing-style rule with `--check-style` |
 | Oversized or unreadable text files | Scan omissions require review |
+
+Writing-style checks are off by default. Add `--check-style` to include the em dash rule in current-file and history scans. This repository enables it explicitly in CI.
 
 ## Narrow exceptions
 

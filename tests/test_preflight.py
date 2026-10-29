@@ -480,7 +480,7 @@ class PreflightTests(unittest.TestCase):
         email = "private" + "@" + "example.org"
         path = "C:" + chr(92) + "Users" + chr(92) + "someone" + chr(92) + "work"
         data = f"{token}\n{email}\n{path}\nhello{chr(0x2014)}world".encode()
-        findings = preflight.scan_bytes("sample.txt", data)
+        findings = preflight.scan_bytes("sample.txt", data, check_style=True)
         self.assertEqual({item.rule for item in findings}, {"credential-token", "email", "personal-path", "em-dash"})
         report = json.dumps([preflight.asdict(item) for item in findings])
         for value in (token, email, path):
@@ -489,6 +489,18 @@ class PreflightTests(unittest.TestCase):
     def test_placeholder_and_real_assignment(self):
         data = ('api_' + 'key = "your-own-key"\n' + 'pass' + 'word = "fixture-private-value"').encode()
         self.assertEqual([item.rule for item in preflight.scan_bytes("a.py", data)], ["credential-assignment"])
+
+    def test_style_is_optional_without_disabling_credential_checks(self):
+        data = ("hello" + chr(0x2014) + "world").encode()
+        self.assertEqual(preflight.scan_bytes("README.md", data), [])
+        self.assertEqual([item.rule for item in preflight.scan_bytes("README.md", data, check_style=True)], ["em-dash"])
+        secret = ("api_" + 'key = "synthetic-private-value"').encode()
+        self.assertIn("credential-assignment", [item.rule for item in preflight.scan_bytes("settings.txt", secret)])
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "README.md").write_bytes(data)
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(preflight.main([directory]), 0)
+                self.assertEqual(preflight.main([directory, "--check-style"]), 1)
 
     def test_quoted_multiline_fallback_and_unquoted_config(self):
         key = "pass" + "word"
