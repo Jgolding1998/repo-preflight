@@ -3,6 +3,8 @@ import io
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
+import stat
 import subprocess
 import sys
 import tempfile
@@ -16,14 +18,15 @@ class PreflightTests(unittest.TestCase):
     def test_overall_history_deadline_spans_successful_git_calls(self):
         now = [0.0]
         calls = []
-        def successful_git(root, *args, deadline=None):
+        oid = b"ab" * 20
+        def successful_git(root, *args, deadline=None, input=None):
             calls.append((args,deadline))
             now[0] += 2
             if args[0] == "rev-parse":
                 return b"false\n"
             if args[0] == "rev-list":
-                return b"aabbcc fixture.txt\n"
-            return b"blob\n"
+                return oid + b" fixture.txt\n"
+            return oid + b" blob 5\n"
         with tempfile.TemporaryDirectory() as directory:
             errors, output = io.StringIO(), io.StringIO()
             with mock.patch.object(preflight, "HISTORY_TIMEOUT", 5), mock.patch.object(preflight.time, "monotonic", side_effect=lambda:now[0]), mock.patch.object(preflight, "git", side_effect=successful_git), contextlib.redirect_stderr(errors), contextlib.redirect_stdout(output):
@@ -139,6 +142,57 @@ class PreflightTests(unittest.TestCase):
             for limit in ("MAX_HISTORY_OBJECTS", "MAX_HISTORY_BYTES", "MAX_GIT_OUTPUT"):
                 with self.subTest(limit=limit), mock.patch.object(preflight, limit, 1), self.assertRaises(preflight.HistoryScanError):
                     list(preflight.history_files(root))
+
+    def scan_history(self, root):
+        return sorted((item.rule, item.path, item.revision) for name, data, revision in preflight.history_files(root) for item in preflight.scan_bytes(name, data, revision))
+
+    def test_history_reads_objects_in_bounded_batches(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = self.make_repository(root)
+            for number in range(12):
+                (root / f"note{number}.txt").write_text(f"line {number}\n" * 200)
+                if number == 5:
+                    (root / "secret.txt").write_text("gh" + "p_" + "D" * 24)
+                run("add", ".")
+                run("commit", "-qm", f"Fixture {number}")
+            calls = []
+            original = preflight.git
+            def counting(root, *args, **options):
+                calls.append(args)
+                return original(root, *args, **options)
+            with mock.patch.object(preflight, "git", side_effect=counting):
+                expected = self.scan_history(root)
+            self.assertIn("credential-token", [rule for rule, _, _ in expected])
+            self.assertEqual(len(calls), 4)
+            calls.clear()
+            with mock.patch.object(preflight, "git", side_effect=counting), mock.patch.object(preflight, "MAX_GIT_OUTPUT", 8192):
+                self.assertEqual(self.scan_history(root), expected)
+            self.assertGreater(sum(args[:2] == ("cat-file", "--batch") for args in calls), 1)
+
+    def test_history_paths_keep_unicode_line_separators(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = self.make_repository(root)
+            blob = run("hash-object", "-w", "--stdin", data=("gh" + "p_" + "E" * 24).encode()).decode().strip()
+            name = "odd name\x1cfile.txt"
+            tree = run("mktree", data=f"100644 blob {blob}\t{name}\n".encode()).decode().strip()
+            commit = run("commit-tree", tree, "-p", "HEAD", "-m", "Fixture").decode().strip()
+            run("update-ref", "refs/heads/odd", commit)
+            self.assertIn(("credential-token", name, blob), self.scan_history(root))
+
+    def test_incomplete_batch_output_fails_closed(self):
+        oid = b"cd" * 20
+        replies = {"rev-parse": b"false\n", "rev-list": oid + b" a.txt\n", "--batch-check": oid + b" blob 10\n", "--batch": oid + b" blob 10\nshort\n"}
+        def fake_git(root, *args, deadline=None, input=None):
+            return replies[args[1] if args[0] == "cat-file" else args[0]]
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(preflight, "git", side_effect=fake_git):
+            errors = io.StringIO()
+            with contextlib.redirect_stderr(errors), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(preflight.main([directory, "--history"]), 2)
+                replies["--batch-check"] = oid + b" missing\n"
+                self.assertEqual(preflight.main([directory, "--history"]), 2)
+            self.assertNotIn("Traceback", errors.getvalue())
 
     def test_missing_promisor_object_cannot_run_a_remote_helper(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -377,6 +431,79 @@ class PreflightTests(unittest.TestCase):
             except OSError:
                 self.skipTest("Creating symlinks requires OS permission")
             self.assertEqual([item[0] for item in preflight.current_files(root, False)], ["real.txt"])
+
+    def test_skipped_directories_are_not_traversed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            for folder in ("node_modules/pkg/lib", ".git/objects", "src"):
+                (root / folder).mkdir(parents=True)
+            (root / "node_modules/pkg/lib/index.js").write_text("x")
+            (root / "src/app.py").write_text("x")
+            visited = []
+            real_scandir = os.scandir
+            def recording(path):
+                visited.append(Path(path))
+                return real_scandir(path)
+            with mock.patch.object(os, "scandir", side_effect=recording):
+                self.assertEqual([item[0] for item in preflight.current_files(root, False)], ["src/app.py"])
+            self.assertEqual(sorted(path.relative_to(root).as_posix() for path in visited), [".", "src"])
+
+    def test_directory_reparse_points_are_not_traversed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            for folder in ("linked", "plain"):
+                (root / folder).mkdir()
+                (root / folder / "a.txt").write_text("x")
+            real_lstat, real_scandir = os.lstat, os.scandir
+            def reparse(path, *args, **kwargs):
+                if Path(path).name == "linked":
+                    return SimpleNamespace(st_mode=stat.S_IFDIR | 0o755, st_file_attributes=stat.FILE_ATTRIBUTE_DIRECTORY | stat.FILE_ATTRIBUTE_REPARSE_POINT, st_reparse_tag=0xA0000003)
+                return real_lstat(path, *args, **kwargs)
+            visited = []
+            def recording(path):
+                visited.append(Path(path).name)
+                return real_scandir(path)
+            with mock.patch.object(os, "lstat", side_effect=reparse), mock.patch.object(os, "scandir", side_effect=recording):
+                self.assertEqual([item[0] for item in preflight.current_files(root, False)], ["plain/a.txt"])
+            self.assertNotIn("linked", visited)
+
+    def test_unknown_directory_reparse_points_are_incomplete_instead_of_silently_skipped(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "cloud").mkdir()
+            (Path(directory) / "cloud/source.txt").write_text("fixture")
+            real_lstat = os.lstat
+            def placeholder(path, *args, **kwargs):
+                if Path(path).name == "cloud":
+                    return SimpleNamespace(st_mode=stat.S_IFDIR | 0o755, st_file_attributes=stat.FILE_ATTRIBUTE_DIRECTORY | stat.FILE_ATTRIBUTE_REPARSE_POINT, st_reparse_tag=0x9000001A)
+                return real_lstat(path, *args, **kwargs)
+            with mock.patch.object(os, "lstat", side_effect=placeholder), contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(preflight.main([directory]), 2)
+
+    def test_unreadable_link_attributes_make_the_scan_incomplete(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "child").mkdir()
+            real_lstat = os.lstat
+            def denied(path, *args, **kwargs):
+                if Path(path).name == "child":
+                    raise PermissionError(13, "denied")
+                return real_lstat(path, *args, **kwargs)
+            with mock.patch.object(os, "lstat", side_effect=denied), contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(preflight.main([directory]), 2)
+
+    def test_unreadable_directory_makes_the_scan_incomplete(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "locked").mkdir()
+            (root / "locked/config.txt").write_text("pass" + "word = 'synthetic-private-value'")
+            real_scandir = os.scandir
+            def denied(path):
+                if Path(path).name == "locked":
+                    raise PermissionError(13, "denied")
+                return real_scandir(path)
+            errors = io.StringIO()
+            with mock.patch.object(os, "scandir", side_effect=denied), contextlib.redirect_stderr(errors), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(preflight.main([directory]), 2)
+            self.assertNotIn("synthetic-private-value", errors.getvalue())
 
     def test_history_detects_removed_value(self):
         with tempfile.TemporaryDirectory() as directory:

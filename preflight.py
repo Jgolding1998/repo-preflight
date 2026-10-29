@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import threading
@@ -24,6 +25,7 @@ MAX_GIT_OUTPUT = 8 * 1024 * 1024
 MAX_HISTORY_OBJECTS = 100_000
 MAX_HISTORY_BYTES = 64 * 1024 * 1024
 HISTORY_TIMEOUT = 120
+OBJECT_ID = re.compile(rb"[0-9a-f]{40}|[0-9a-f]{64}")
 SKIP_DIRS = {".git", ".venv", "venv", "node_modules", "__pycache__", ".pytest_cache"}
 EMAIL = re.compile(r"\b[A-Z0-9._%+-]{1,64}@[A-Z0-9.-]{1,253}\.[A-Z]{2,63}(?![A-Z0-9-])", re.I)
 PERSONAL_PATH = re.compile(r"(?:[A-Z]:[\\/]Users[\\/][^\\/\s]+|/(?:Users|home)/[^/\s]+)", re.I)
@@ -103,7 +105,7 @@ def scan_bytes(path: str, data: bytes, revision: str = "", terms: tuple[str, ...
     return list(dict.fromkeys(output))
 
 
-def git(root: Path, *args: str, deadline: float | None = None) -> bytes:
+def git(root: Path, *args: str, deadline: float | None = None, input: bytes | None = None) -> bytes:
     location = shutil.which("git")
     if not location:
         raise ValueError("Git is not installed")
@@ -118,15 +120,26 @@ def git(root: Path, *args: str, deadline: float | None = None) -> bytes:
     timeout = 60.0 if deadline is None else min(60.0, deadline - time.monotonic())
     if timeout <= 0:
         raise HistoryScanError("History deadline reached. The scan is incomplete; reduce the scope and rerun.")
-    with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=environment) as process:
+    stdin = subprocess.DEVNULL if input is None else subprocess.PIPE
+    with subprocess.Popen(command, stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=environment) as process:
         def stop():
             try:
                 process.kill()
             except OSError:
                 pass
+        def feed():
+            try:
+                process.stdin.write(input)
+                process.stdin.close()
+            except (OSError, ValueError):
+                pass
         timer = threading.Timer(timeout, stop)
         timer.daemon = True
         timer.start()
+        writer = None
+        if input is not None:
+            writer = threading.Thread(target=feed, daemon=True)
+            writer.start()
         try:
             data = process.stdout.read(MAX_GIT_OUTPUT + 1)
             if len(data) > MAX_GIT_OUTPUT:
@@ -143,6 +156,8 @@ def git(root: Path, *args: str, deadline: float | None = None) -> bytes:
             if process.poll() is None:
                 stop()
             process.wait(timeout=2)
+            if writer is not None:
+                writer.join(timeout=2)
 
 
 def current_files(root: Path, tracked: bool):
@@ -150,7 +165,7 @@ def current_files(root: Path, tracked: bool):
         names = git(root, "ls-files", "-z").decode("utf-8").split("\0")
         paths = [root / name for name in names if name]
     else:
-        paths = root.rglob("*")
+        paths = walk_files(root)
     for path in paths:
         relative = path.relative_to(root)
         if any(part in SKIP_DIRS for part in relative.parts) or path.is_symlink():
@@ -158,10 +173,30 @@ def current_files(root: Path, tracked: bool):
         if path.is_file():
             if not path.resolve().is_relative_to(root):
                 continue
-            if path.stat().st_size > MAX_BYTES:
-                yield relative.as_posix(), b"x" * (MAX_BYTES + 1), ""
-            else:
-                yield relative.as_posix(), path.read_bytes(), ""
+            with path.open("rb") as stream:
+                data = stream.read(MAX_BYTES + 1)
+            yield relative.as_posix(), data, ""
+
+
+def walk_files(root: Path):
+    def fail(error):
+        raise error
+    for directory, folders, files in os.walk(root, onerror=fail):
+        base = Path(directory)
+        folders[:] = sorted(name for name in folders if name not in SKIP_DIRS and not is_link(base / name))
+        for name in sorted(files):
+            yield base / name
+
+
+def is_link(path: Path) -> bool:
+    info = os.lstat(path)
+    if stat.S_ISLNK(info.st_mode):
+        return True
+    if getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+        if getattr(info, "st_reparse_tag", 0) in {0xA0000003, 0xA000000C}:
+            return True
+        raise ValueError("Unsupported reparse point. The scan is incomplete; use a fully local checkout.")
+    return False
 
 
 def history_files(root: Path):
@@ -169,31 +204,70 @@ def history_files(root: Path):
     def check_deadline():
         if time.monotonic() >= deadline:
             raise HistoryScanError("History deadline reached. The scan is incomplete; reduce the scope and rerun.")
-    def read(*args):
+    def read(*args, input=None):
         check_deadline()
-        return git(root, *args, deadline=deadline)
+        return git(root, *args, deadline=deadline, input=input)
+    def read_cost(item):
+        return item[2] + 128 if item[2] <= MAX_BYTES else 0
     if read("rev-parse", "--is-shallow-repository").strip() == b"true":
         raise HistoryScanError("History scan requires a full clone. Fetch complete history (for example, git fetch --unshallow) and rerun.")
-    objects = read("rev-list", "--objects", "--all").decode("utf-8").splitlines()
-    if len(objects) > MAX_HISTORY_OBJECTS:
+    listing = read("rev-list", "--objects", "--all").split(b"\n")
+    if listing[-1] == b"":
+        listing.pop()
+    if len(listing) > MAX_HISTORY_OBJECTS:
         raise HistoryScanError("History exceeds the object-count limit. Reduce the scan scope and rerun.")
+    entries = []
+    for line in listing:
+        oid, _, name = line.partition(b" ")
+        if not OBJECT_ID.fullmatch(oid):
+            raise ValueError("Unexpected Git object listing")
+        entries.append((oid, name.decode("utf-8")))
+    if not entries:
+        return
+    checks = read("cat-file", "--batch-check", "--buffer", input=b"".join(oid + b"\n" for oid, _ in entries)).split(b"\n")
+    if len(checks) != len(entries) + 1 or checks[-1] != b"":
+        raise ValueError("Git object check is incomplete")
+    selected = []
     scanned_bytes = 0
-    for entry in objects:
-        check_deadline()
-        oid, _, name = entry.partition(" ")
-        kind = read("cat-file", "-t", oid).strip()
+    for (oid, name), check in zip(entries, checks):
+        fields = check.split(b" ")
+        if len(fields) != 3 or fields[0] != oid or not fields[2].isdigit():
+            raise ValueError("Git object is missing or unreadable")
+        kind, size = fields[1], int(fields[2])
         if kind not in {b"blob", b"commit", b"tag"}:
             continue
         path = name or "[unnamed-blob]"
         if kind != b"blob":
             path = "[commit-metadata].txt" if kind == b"commit" else "[tag-metadata].txt"
-        size = int(read("cat-file", "-s", oid))
         scanned_bytes += min(size, MAX_BYTES + 1)
         if scanned_bytes > MAX_HISTORY_BYTES:
             raise HistoryScanError("History exceeds the byte budget. Reduce the scan scope and rerun.")
-        data = b"x" * (MAX_BYTES + 1) if size > MAX_BYTES else read("cat-file", kind.decode("ascii"), oid)
-        yield path, data, oid
-        check_deadline()
+        selected.append((oid, kind, size, path))
+    start = 0
+    while start < len(selected):
+        end, output = start, 0
+        while end < len(selected) and (end == start or output + read_cost(selected[end]) <= MAX_GIT_OUTPUT):
+            output += read_cost(selected[end])
+            end += 1
+        group = selected[start:end]
+        wanted = [item for item in group if item[2] <= MAX_BYTES]
+        data = read("cat-file", "--batch", "--buffer", input=b"".join(oid + b"\n" for oid, *_ in wanted)) if wanted else b""
+        position = 0
+        for oid, kind, size, path in group:
+            if size > MAX_BYTES:
+                yield path, b"x" * (MAX_BYTES + 1), oid.decode("ascii")
+                check_deadline()
+                continue
+            header_end = data.find(b"\n", position)
+            body_end = header_end + 1 + size
+            if header_end < 0 or data[position:header_end] != b"%s %s %d" % (oid, kind, size) or data[body_end:body_end + 1] != b"\n":
+                raise ValueError("Git object content is incomplete")
+            yield path, data[header_end + 1:body_end], oid.decode("ascii")
+            position = body_end + 1
+            check_deadline()
+        if position != len(data):
+            raise ValueError("Git object content is incomplete")
+        start = end
 
 
 def _unique_config_fields(pairs):
