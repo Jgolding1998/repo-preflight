@@ -15,6 +15,45 @@ import preflight
 
 
 class PreflightTests(unittest.TestCase):
+    def test_unquoted_shell_literals_before_semicolons_are_detected(self):
+        key, value = "API_" + "TOKEN", "owned-" + "synthetic-literal-4728"
+        lines = [key + "=" + value + ";", key + "=" + value + "; echo ready",
+                 "export " + key + "=" + value + "; echo ready",
+                 "export " + key + "=" + value + " ; echo ready",
+                 key + "=" + value + "#fragment;", key + "=" + value + "; # comment"]
+        for line in lines:
+            with self.subTest(line=line):
+                found = preflight.scan_bytes("setup.sh", line.encode())
+                self.assertEqual([item.rule for item in found], ["credential-assignment"])
+
+    def test_shell_semicolon_controls_preserve_scope_and_literal_boundaries(self):
+        key, value = "API_" + "TOKEN", "owned-" + "synthetic-literal-4728"
+        for line in ("# " + key + "=" + value + ";", 'echo "' + key + "=" + value + ';"',
+                     key + "=$OTHER;", key + "=${OTHER};", key + "=$(printf safe);",
+                     key + "=`printenv OTHER`;", key + "=short;", key + "=your-token-here;"):
+            self.assertEqual(preflight.scan_bytes("setup.sh", line.encode()), [])
+        self.assertEqual(preflight.scan_bytes("example.py", (key + "=" + value + ";").encode()), [])
+        for quote in ("'", '"'):
+            found = preflight.scan_bytes("setup.sh", (key + "=" + quote + value + quote + "; echo ready").encode())
+            self.assertEqual(len(found), 1)
+        escaped = value + r"\;tail"
+        found = preflight.scan_bytes("setup.sh", (key + "=" + escaped + "; echo ready").encode())
+        self.assertEqual(found, [preflight.finding("credential-assignment", "setup.sh", 1, escaped)])
+
+    def test_shell_semicolon_reports_remain_redacted_and_bounded(self):
+        key, value = "API_" + "TOKEN", "owned-" + "synthetic-literal-4728"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "setup.sh"
+            path.write_text(key + "=" + value + "; echo ready")
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(preflight.main([directory, "--json"]), 1)
+            report = json.loads(output.getvalue())
+            self.assertEqual(report["findings"][0]["fingerprint"], preflight.finding("credential-assignment", "setup.sh", 1, value).fingerprint)
+            self.assertNotIn(value, output.getvalue())
+        found = preflight.scan_bytes("setup.sh", (key + "=" + "z" * 200000 + ";").encode())
+        self.assertEqual(len(found), 1)
+
     def test_aws_temporary_access_ids_have_exact_length_and_identifier_boundaries(self):
         value = "AS" + "IA" + "Q7D2M5C4V6B3N2AZ"
         for before, after in (("", ""), ('"', '"'), ("[", "]"), ("prefix-", "/next"), ("\n", "\r\n")):

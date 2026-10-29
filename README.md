@@ -16,7 +16,7 @@ Exit codes: `0` clean, `1` findings, `2` incomplete scan. CI should fail for bot
 
 | Rule | Why it matters |
 | --- | --- |
-| Credential tokens and assignments | Common provider keys, quoted JSON keys, typed, `:=`, `=>` and subscript assignments, multiline literals, unquoted values with embedded `#` or trailing `#` comments, and common environment fallback patterns |
+| Credential tokens and assignments | Common provider keys, quoted JSON keys, typed, `:=`, `=>` and subscript assignments, multiline literals, unquoted values with embedded `#` or trailing `#` comments, simple unquoted shell literals before `;`, and common environment fallback patterns |
 | Private key headers | A private key should never be a fixture or source asset |
 | Emails and personal home paths | Easy-to-miss identity leaks in examples and scripts |
 | Environment files | Real `.env` files belong outside version control |
@@ -40,6 +40,8 @@ This repository uses `--config preflight-rules.json` for its self-scan. It allow
 Rules return immutable findings, separate from reporting and file discovery. UTF-8 and BOM-marked UTF-16/UTF-32 text are supported. Escaped Windows paths in JSON are normalized for detection. Current-tree mode skips dependency folders, symlinks and Windows junctions without descending into them. An unreadable directory, unreadable file attribute or unsupported file or directory reparse point exits `2`. Tracked mode also checks parent directories and treats a missing indexed file as incomplete; stage an intentional deletion before scanning. Use a fully local checkout if cloud placeholder folders prevent a complete scan.
 
 Tracked mode reads working files, not staged index contents, and requires a full working tree rather than a sparse checkout. It does not descend into submodules or directories that replace indexed files. Quoted source construction can also look like a credential literal; review such findings before creating an exact exception.
+
+The shell extension checks a simple leading assignment, optionally prefixed with `export`, before a semicolon in `.sh`, `.profile`, `.bash_profile`, `.bashrc`, `.zprofile` and `.zshrc` files. It preserves escaped semicolons and embedded `#` within the literal. It does not interpret shell commands, resolve expansions or follow arbitrary compound statements.
 
 Git commands use argument arrays, never a shell. Inherited `GIT_*` variables are removed, global and system configuration are ignored, and filesystem-monitor helpers, signature verification and hooks are disabled. Lazy fetching and Git transport protocols are disabled, so missing objects fail the scan without running a remote helper. Repository-local configuration, including its includes, is still read. The scanner reads raw objects without checkout filters and does not modify the repository.
 

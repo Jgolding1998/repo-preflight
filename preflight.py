@@ -36,6 +36,9 @@ FIELD_PATTERN = (r"(?<![\w-])(?=[a-z0-9_-]{0," + str(MAX_FIELD_NAME - 1)
 QUOTED_VALUE = r'''(?:"([^"\\\r\n]*+(?:\\[^\r\n][^"\\\r\n]*+)*+)"|'([^'\\\r\n]*+(?:\\[^\r\n][^'\\\r\n]*+)*+)')'''
 ASSIGNMENT = re.compile(r"[\"']?" + FIELD_PATTERN + r"[\"']?\]?\s*(?::[ \t]*[A-Za-z_][\w.\[\]| \t]{0,64}?=|:=|=>|[:=])\s*(?:\(\s*)?" + QUOTED_VALUE, re.I)
 ENV_ASSIGNMENT = re.compile(r"^[ \t]*(?:export[ \t]+)?" + FIELD_PATTERN + r"[ \t]*[:=][ \t]*([^\s\"'#$({][^\s;]{7,}+)(?:[ \t]+#[^\r\n]*)?[ \t\r]*$", re.I | re.M)
+SHELL_ASSIGNMENT = re.compile(r"^[ \t]*(?:export[ \t]+)?" + FIELD_PATTERN
+                              + r'''=((?![#$({`])(?:\\[^\r\n]|[^\s\\"'`$(){};&|<>])++)(?=[ \t]*;)''', re.I | re.M)
+SHELL_NAMES = {".profile", ".bash_profile", ".bashrc", ".zprofile", ".zshrc"}
 FALLBACK = re.compile(FIELD_PATTERN + r"\s*=\s*(?:process\.env\.[A-Z0-9_]+|os\.environ\.get\([^()\r\n]{0,1024}\)|os\.getenv\([^()\r\n]{0,1024}\))\s*(?:\|\||or)\s*" + QUOTED_VALUE, re.I)
 PLACEHOLDER = re.compile(r"^(?:your[-_ ].*|replace[-_ ].*|example|example[-_ ].*|placeholder|placeholder[-_ ].*|changeme|<.*>|\$\{.*\}|test[-_ ].*)$", re.I)
 PRIVATE_KEY = re.compile(r"-----BEGIN (?:(?:RSA |EC |OPENSSH |DSA |ENCRYPTED )?PRIVATE KEY|PGP PRIVATE KEY BLOCK)-----")
@@ -94,6 +97,8 @@ def scan_bytes(path: str, data: bytes, revision: str = "", terms: tuple[str, ...
     patterns = [ASSIGNMENT, FALLBACK]
     if Path(path).suffix.lower() in {".txt", ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".sh"} or base in {".profile", ".bash_profile", ".bashrc", ".zprofile", ".zshrc"} or base.startswith(".env") or path == "[unnamed-blob]":
         patterns.append(ENV_ASSIGNMENT)
+    if Path(path).suffix.lower() == ".sh" or base in SHELL_NAMES:
+        patterns.append(SHELL_ASSIGNMENT)
     line_starts = [0] + [match.end() for match in re.finditer("\n", content)]
     for pattern in patterns:
         for match in pattern.finditer(content):
