@@ -27,15 +27,23 @@ Exit codes: `0` clean, `1` findings, `2` incomplete scan. CI should fail for bot
 
 Use `--config rules.json` for `blocked_terms` and an `allow` list. Every exception needs an exact `rule`, `path`, `fingerprint`, and a written `reason`. Copy only the fingerprint from a redacted report. Exceptions do not support glob paths. Changing the matched value invalidates its exception.
 
+Config files accept only these two fields, reject duplicate keys, and are limited to 2 MiB, 128 blocked terms and 4,096 exceptions. History traversal ignores replacement objects and graft files.
+
 ```json
 {"blocked_terms": [], "allow": []}
 ```
 
 ## Design choices
 
-Rules return immutable findings, separate from reporting and file discovery. UTF-8 and BOM-marked UTF-16/UTF-32 text are supported. Escaped Windows paths in JSON are normalized for detection. Current-tree mode skips dependency folders and symlinks. Git mode uses argument arrays, never a shell, and disables filesystem-monitor helpers, signature verification, hooks, and inherited Git settings. History mode scans each reachable blob and commit identity; it can catch a value removed from the latest revision. It does not modify any file or repository.
+Rules return immutable findings, separate from reporting and file discovery. UTF-8 and BOM-marked UTF-16/UTF-32 text are supported. Escaped Windows paths in JSON are normalized for detection. Current-tree mode skips dependency folders and symlinks.
 
-This is a fast hygiene check, not a replacement for [Gitleaks](https://github.com/gitleaks/gitleaks), credential rotation, dependency auditing, or manual review. It does not unpack binary documents, inspect ignored files in tracked mode, identify arbitrary personal names unless configured, or prove a repository safe. Binary contents and BOM-less UTF-16/UTF-32 are skipped; large files are flagged. The token rules cover selected GitHub, OpenAI, AWS, Stripe, Slack, and Google formats, not every provider or obfuscation. Unusual field names, connection strings, encrypted archives, and obfuscated values still require a dedicated scanner and review. History mode covers locally reachable refs, not GitHub caches, forks, remote-only refs, or other clones. File and directory names are shown in reports. Fingerprints are deterministic hashes, so someone can confirm a guessed low-entropy value. Keep reports private.
+Git commands use argument arrays, never a shell. Inherited `GIT_*` variables are removed, global and system configuration are ignored, and filesystem-monitor helpers, signature verification and hooks are disabled. Lazy fetching and Git transport protocols are disabled, so missing objects fail the scan without running a remote helper. Repository-local configuration, including its includes, is still read. The scanner reads raw objects without checkout filters and does not modify the repository.
+
+History mode scans locally reachable blobs, including blobs tagged without a filename, plus raw commit and annotated-tag metadata. This includes commit messages, tag messages, author, committer and tagger identities. Reports use object IDs and virtual paths for metadata and unnamed blobs; matched values remain redacted. Binary metadata is flagged instead of silently skipped.
+
+History scans require a full clone. A shallow clone exits `2` with guidance to fetch complete history, for example `git fetch --unshallow`; the scanner never fetches automatically. The local scan is bounded to 100,000 reachable objects and 64 MiB of sampled historical content. Each object is limited to 2 MiB; larger objects are flagged. The history phase has a 120-second budget checked between object scans. Git commands use the smaller of 60 seconds or the remaining history budget, with an 8 MiB output cap. An in-progress file check completes before the deadline is checked again. Exceeding an aggregate limit exits `2`, rather than reporting a complete scan.
+
+This is a fast hygiene check, not a replacement for [Gitleaks](https://github.com/gitleaks/gitleaks), credential rotation, dependency auditing, or manual review. It does not unpack binary documents, inspect untracked files in tracked mode, identify arbitrary personal names unless configured, or prove a repository safe. Binary file contents and BOM-less UTF-16/UTF-32 are skipped; large files are flagged. The token rules cover selected GitHub, OpenAI, AWS, Stripe, Slack, and Google formats, not every provider or obfuscation. Credential field names are limited to 128 characters and simple environment lookup arguments to 1,024 characters. Unusual field names, nested expressions, connection strings, encrypted archives, and obfuscated values still require a dedicated scanner and review. History mode covers locally reachable refs, not GitHub caches, forks, remote-only refs, or other clones. File and directory names are shown in reports. Fingerprints are deterministic hashes, so someone can confirm a guessed low-entropy value. Keep reports private.
 
 ## Useful workflow
 
@@ -44,4 +52,4 @@ This is a fast hygiene check, not a replacement for [Gitleaks](https://github.co
 3. Review each finding, remove the cause, and rerun the check.
 4. Rotate any credential that was committed. Deleting the source line does not revoke it.
 
-Tests use temporary repositories and synthetic values assembled in memory. They verify redaction, removed-history detection, exit codes, binary limits, and exact exceptions. No production credentials are used.
+Tests use temporary repositories and synthetic values assembled in memory. They verify redaction, removed history, graft and replacement handling, tagged blobs, commit and tag metadata, shallow clones, scan budgets, exported environment assignments, malformed configuration, exact exceptions and bounded adversarial inputs. No production credentials are used.

@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Project feedback
+    url: https://github.com/Jgolding1998/Jgolding1998/issues/new?template=feedback.yml&title=%5Brepo-preflight%5D%20
+    about: Suggestions, likes, dislikes and problems go to the central feedback board. Select repo-preflight in the form.
+  - name: Security reporting
+    url: https://github.com/Jgolding1998/repo-preflight/blob/main/SECURITY.md
+    about: Read this policy for suspected vulnerabilities. Do not post details in public feedback.
