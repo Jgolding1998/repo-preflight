@@ -57,6 +57,10 @@ class HistoryScanError(ValueError):
     pass
 
 
+class ConfigError(ValueError):
+    """Config problem whose fixed message never includes config values or paths."""
+
+
 def finding(rule: str, path: str, line: int, value: str, revision: str = "") -> Finding:
     digest = hashlib.sha256((rule + "\0" + value).encode()).hexdigest()[:20]
     return Finding(rule, path, line, digest, revision)
@@ -303,12 +307,14 @@ def history_files(root: Path):
             continue
         names = sorted(paths.get(oid, set()) | {name or "[unnamed-blob]"}) if kind == b"blob" else ["[commit-metadata].txt" if kind == b"commit" else "[tag-metadata].txt"]
         for path in names:
-            scanned_bytes += min(size, MAX_BYTES + 1)
+            # Oversized objects are reported from their recorded size and never read, so only readable aliases spend the byte budget.
+            scanned_bytes += size if size <= MAX_BYTES else 0
             if scanned_bytes > MAX_HISTORY_BYTES:
                 raise HistoryScanError("History exceeds the byte budget. Reduce the scan scope and rerun.")
             if len(selected) >= MAX_HISTORY_OBJECTS:
                 raise HistoryScanError("History exceeds the path-count limit. Reduce the scan scope and rerun.")
             selected.append((oid, kind, size, path))
+    oversized = None  # One shared immutable placeholder; scan_bytes only checks its length.
     start = 0
     while start < len(selected):
         end, output = start, 0
@@ -321,7 +327,9 @@ def history_files(root: Path):
         position = 0
         for oid, kind, size, path in group:
             if size > MAX_BYTES:
-                yield path, b"x" * (MAX_BYTES + 1), oid.decode("ascii")
+                if oversized is None:
+                    oversized = b"x" * (MAX_BYTES + 1)
+                yield path, oversized, oid.decode("ascii")
                 check_deadline()
                 continue
             header_end = data.find(b"\n", position)
@@ -340,7 +348,7 @@ def _unique_config_fields(pairs):
     result = {}
     for key, value in pairs:
         if key in result:
-            raise ValueError("Duplicate config fields")
+            raise ConfigError("Duplicate config fields")
         result[key] = value
     return result
 
@@ -351,22 +359,26 @@ def load_config(path: Path | None) -> tuple[tuple[str, ...], list[dict]]:
     with path.open("rb") as stream:
         raw = stream.read(MAX_BYTES + 1)
     if len(raw) > MAX_BYTES:
-        raise ValueError("Config exceeds the size limit")
+        raise ConfigError(f"Config exceeds the {MAX_BYTES // (1024 * 1024)} MiB size limit")
     try:
         config = json.loads(raw.decode("utf-8-sig"), object_pairs_hook=_unique_config_fields)
     except (RecursionError, OverflowError):
-        raise ValueError("Config nesting or number is unsupported") from None
+        raise ConfigError("Config nesting or number is unsupported") from None
     if type(config) is not dict or set(config) - {"blocked_terms", "allow"}:
-        raise ValueError("Config must contain only blocked_terms and allow")
+        raise ConfigError("Config must contain only blocked_terms and allow")
     terms = config.get("blocked_terms", [])
     allows = config.get("allow", [])
-    if not isinstance(terms, list) or len(terms) > MAX_TERMS or any(not isinstance(term, str) or not term.strip() for term in terms):
-        raise ValueError("blocked_terms must be a list of nonempty strings")
-    if not isinstance(allows, list) or len(allows) > MAX_EXCEPTIONS:
-        raise ValueError("allow must be a list")
+    if isinstance(terms, list) and len(terms) > MAX_TERMS:
+        raise ConfigError(f"blocked_terms has too many entries; the limit is {MAX_TERMS}")
+    if not isinstance(terms, list) or any(not isinstance(term, str) or not term.strip() for term in terms):
+        raise ConfigError("blocked_terms must be a list of nonempty strings")
+    if not isinstance(allows, list):
+        raise ConfigError("allow must be a list")
+    if len(allows) > MAX_EXCEPTIONS:
+        raise ConfigError(f"allow has too many exceptions; the limit is {MAX_EXCEPTIONS}")
     for item in allows:
         if not isinstance(item, dict) or not all(isinstance(item.get(key), str) and item[key].strip() for key in ("rule", "path", "fingerprint", "reason")):
-            raise ValueError("Each exception requires rule, exact path, fingerprint, and reason")
+            raise ConfigError("Each exception requires rule, exact path, fingerprint, and reason")
     return tuple(terms), allows
 
 
@@ -400,6 +412,9 @@ def main(argv: list[str] | None = None) -> int:
         found = list(dict.fromkeys(item for item in found if not allowed(item, exceptions)))
     except HistoryScanError as error:
         print(str(error), file=sys.stderr)
+        return 2
+    except ConfigError as error:
+        print("Config is invalid: " + str(error) + ".", file=sys.stderr)
         return 2
     except (OSError, ValueError, UnicodeError, subprocess.SubprocessError):
         print("Scan could not complete. Check paths, config, permissions, and Git installation.", file=sys.stderr)

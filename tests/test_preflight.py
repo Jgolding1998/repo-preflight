@@ -306,6 +306,30 @@ class PreflightTests(unittest.TestCase):
                 with self.subTest(limit=limit), mock.patch.object(preflight, limit, 1), self.assertRaises(preflight.HistoryScanError):
                     list(preflight.history_files(root))
 
+    def test_unread_oversized_aliases_do_not_spend_the_history_byte_budget(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = self.make_repository(root)
+            for number in range(20):
+                (root / f"large{number}.bin").write_text("y" * 200)
+            run("add", ".")
+            run("commit", "-qm", "Oversized fixture")
+            with mock.patch.object(preflight, "MAX_BYTES", 64), mock.patch.object(preflight, "MAX_HISTORY_BYTES", 1000):
+                found = self.scan_history(root)
+                oversized = {path for rule, path, _ in found if rule == "oversized-file"}
+                self.assertTrue({f"large{number}.bin" for number in range(20)} <= oversized)
+                placeholders = [data for _, data, _ in preflight.history_files(root) if len(data) > preflight.MAX_BYTES]
+                self.assertGreaterEqual(len(placeholders), 20)
+                self.assertTrue(all(data is placeholders[0] for data in placeholders))
+                self.assertEqual(len(placeholders[0]), 65)
+                (root / "small.txt").write_text("z" * 60)
+                for number in range(20):
+                    (root / f"small{number}.txt").write_text("z" * 60)
+                run("add", ".")
+                run("commit", "-qm", "Readable fixture")
+                with self.assertRaises(preflight.HistoryScanError):
+                    list(preflight.history_files(root))
+
     def scan_history(self, root):
         return sorted((item.rule, item.path, item.revision) for name, data, revision in preflight.history_files(root) for item in preflight.scan_bytes(name, data, revision))
 
@@ -444,10 +468,24 @@ class PreflightTests(unittest.TestCase):
     def test_config_limits_are_explicit(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "rules.json"
-            for data in ({"blocked_terms": ["fixture"] * (preflight.MAX_TERMS + 1)}, {"allow": [{}] * (preflight.MAX_EXCEPTIONS + 1)}):
+            private = "PrivateFixtureTerm"
+            entry = {"rule": "email", "path": private, "fingerprint": private, "reason": private}
+            cases = [({"blocked_terms": [private] * (preflight.MAX_TERMS + 1)}, "blocked_terms has too many entries; the limit is 128"),
+                     ({"allow": [entry] * (preflight.MAX_EXCEPTIONS + 1)}, "allow has too many exceptions; the limit is 4096"),
+                     ({"allow": {}}, "allow must be a list")]
+            for data, message in cases:
                 path.write_text(json.dumps(data))
-                with self.assertRaises(ValueError):
+                with self.assertRaises(preflight.ConfigError) as caught:
                     preflight.load_config(path)
+                self.assertEqual(str(caught.exception), message)
+                errors = io.StringIO()
+                with contextlib.redirect_stderr(errors), contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(preflight.main([directory, "--config", str(path)]), 2)
+                self.assertEqual(errors.getvalue(), "Config is invalid: " + message + ".\n")
+                self.assertNotIn(private, errors.getvalue())
+                self.assertNotIn(directory, errors.getvalue())
+            path.write_text(json.dumps({"allow": [entry] * preflight.MAX_EXCEPTIONS}))
+            self.assertEqual(len(preflight.load_config(path)[1]), preflight.MAX_EXCEPTIONS)
             path.write_bytes(b" " * (preflight.MAX_BYTES + 1))
             with self.assertRaises(ValueError):
                 preflight.load_config(path)
