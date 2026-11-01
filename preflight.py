@@ -28,6 +28,10 @@ HISTORY_TIMEOUT = 120
 OBJECT_ID = re.compile(rb"[0-9a-f]{40}|[0-9a-f]{64}")
 SKIP_DIRS = {".git", ".venv", "venv", "node_modules", "__pycache__", ".pytest_cache"}
 EMAIL = re.compile(r"\b[A-Z0-9._%+-]{1,64}@[A-Z0-9.-]{1,253}\.[A-Z]{2,63}(?![A-Z0-9-])", re.I)
+GITHUB_TECHNICAL_IDENTITY = re.compile(
+    r"(?:noreply@github\.com|(?:[0-9]{1,20}\+)?[A-Z0-9](?:[A-Z0-9-]{0,37}[A-Z0-9])?@users\.noreply\.github\.com)", re.I)
+GIT_IDENTITY_HEADER = re.compile(
+    r"(?P<kind>author|committer|tagger) [^<>\r\n]*<(?P<email>[^<>\r\n]+)> -?[0-9]{1,13} [+-][0-9]{4}")
 PERSONAL_PATH = re.compile(r"(?:[A-Z]:[\\/]Users[\\/][^\\/\s]+|/(?:Users|home)/[^/\s]+)", re.I)
 TOKEN = re.compile(r"(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{30,}|sk-(?:proj-)?[A-Za-z0-9_-]{20,}|AKIA[A-Z0-9]{16}|(?<!\w)ASIA[A-Z0-9]{16}(?!\w)|sk_live_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{20,}|AIza[A-Za-z0-9_-]{35})")
 FIELD_PATTERN = (r"(?<![\w-])(?=[a-z0-9_-]{0," + str(MAX_FIELD_NAME - 1)
@@ -66,6 +70,18 @@ def finding(rule: str, path: str, line: int, value: str, revision: str = "") -> 
     return Finding(rule, path, line, digest, revision)
 
 
+def _technical_github_header_email_span(line: str, fields: set[str]) -> tuple[int, int] | None:
+    """A platform privacy identity is not a disclosed personal contact address.
+
+    Only the exact identity field is exempt from the email rule. Header display
+    names, messages, source files and all other rules remain scanned unchanged.
+    """
+    identity = GIT_IDENTITY_HEADER.fullmatch(line)
+    if identity and identity["kind"] in fields and GITHUB_TECHNICAL_IDENTITY.fullmatch(identity["email"]):
+        return identity.span("email")
+    return None
+
+
 def scan_bytes(path: str, data: bytes, revision: str = "", terms: tuple[str, ...] = (), *, check_style: bool = False) -> list[Finding]:
     output: list[Finding] = []
     folded_terms = tuple(term.casefold() for term in terms)
@@ -98,10 +114,22 @@ def scan_bytes(path: str, data: bytes, revision: str = "", terms: tuple[str, ...
             content = data.decode("utf-8-sig")
     except UnicodeDecodeError:
         return output + [finding("unreadable-text", path, 0, hashlib.sha256(data).hexdigest(), revision)]
+    # The history reader assigns these virtual paths to raw commit/tag objects.
+    # Require an object ID and stop at the header/body separator; a message that
+    # merely resembles an author header must still receive the email rule.
+    fields = ({"author", "committer"} if path == "[commit-metadata].txt" else
+              {"tagger"} if path == "[tag-metadata].txt" else set())
+    metadata_headers = bool(fields and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", revision))
     for number, line in enumerate(content.splitlines(), 1):
+        if not line:
+            metadata_headers = False
+        # Classify a header once, not once per email in a potentially long name.
+        technical_email_span = _technical_github_header_email_span(line, fields) if metadata_headers else None
         for rule, pattern in (("credential-token", TOKEN), ("private-key", PRIVATE_KEY), ("email", EMAIL), ("personal-path", PERSONAL_PATH)):
             candidate = line.replace("\\\\", "\\").replace("\\/", "/") if rule == "personal-path" else line
             for match in pattern.finditer(candidate):
+                if rule == "email" and technical_email_span == match.span():
+                    continue
                 output.append(finding(rule, path, number, match.group(), revision))
         if check_style and chr(0x2014) in line:
             output.append(finding("em-dash", path, number, line, revision))
