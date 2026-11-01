@@ -52,6 +52,15 @@ Locally reachable history can use Git objects in configured alternate object dir
 
 History mode scans locally reachable blobs, including blobs tagged without a filename, plus raw commit and annotated-tag metadata. This includes commit messages, tag messages, author, committer and tagger identities. Reports use object IDs and virtual paths for metadata and unnamed blobs; matched values remain redacted. Binary metadata is flagged instead of silently skipped.
 
+The email rule treats GitHub's documented privacy identities and its system
+web-commit identity as technical attribution, rather than personal contact
+disclosures, only inside the exact author, committer or tagger email header of a
+historical metadata object. See [GitHub's email address reference](https://docs.github.com/en/account-and-profile/reference/email-addresses-reference).
+This does not exempt display names, commit/tag messages, source files, lookalike
+domains or personal email addresses. Credential, private-key, blocked-term,
+personal-path and opt-in style checks still inspect the entire metadata. No
+repository-specific identity exception or authorship rewrite is needed.
+
 Historical blobs are checked at every path recorded in commit diffs, including separate merge-parent diffs, plus the representative name supplied by Git object traversal. Identical content renamed from `.env` to a documentation file still receives its original environment-file and configuration checks. Path records use NUL delimiters, and exact path exceptions remain specific to each historical name. Each object/path scan counts toward the existing 100,000-scan bound, and each readable (2 MiB or smaller) object/path scan counts toward the 64 MiB sampled-content bound, so repeatedly renamed content can exhaust a budget sooner. Objects over 2 MiB are flagged from their recorded size without being read, so their path aliases do not spend the content budget. Git path discovery also shares the history deadline and output cap; large merge diffs can exceed that cap even when the unique object count fits. Trees reachable only through tags retain their representative traversal names; their other path aliases are not exhaustively enumerated.
 
 History scans require a full clone. A shallow clone exits `2` with guidance to fetch complete history, for example `git fetch --unshallow`; the scanner never fetches automatically. The local scan is bounded to 100,000 reachable objects and 64 MiB of sampled historical content. Each object is limited to 2 MiB; larger objects are flagged. Object types and sizes come from one `git cat-file --batch-check` call, and contents are read in `git cat-file --batch` groups that fit the output cap, so process count does not grow with history length. A missing object or inconsistent batch reply exits `2`. The history phase has a 120-second budget checked between object scans. Git commands use the smaller of 60 seconds or the remaining history budget, with an 8 MiB output cap. An in-progress file check completes before the deadline is checked again. Exceeding an aggregate limit exits `2`, rather than reporting a complete scan.
